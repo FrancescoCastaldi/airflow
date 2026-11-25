@@ -1841,6 +1841,27 @@ class TestXComsSetEndpoint:
         dag_result = XComModelV2.get_for_attempt(ti.id, "return_value", session=session).dag_result
         assert dag_result is True
 
+    def test_xcom_set_value_error(self, client, create_task_instance, authenticate_as, session):
+        """ValueError from XComModel.set_for_attempt returns an RFC 9457 detail dict."""
+        ti = create_task_instance()
+        session.commit()
+        authenticate_as(ti)
+
+        error_message = f"Task instance not found: {ti.dag_id}.{ti.task_id} in {ti.run_id}"
+        with patch.object(XComModel, "set_for_attempt", side_effect=ValueError(error_message)):
+            response = client.post(
+                f"/execution/xcoms/{ti.dag_id}/{ti.run_id}/{ti.task_id}/xcom_1",
+                json=serialize("value1"),
+            )
+
+        assert response.status_code == 404
+        assert response.json() == {
+            "detail": {
+                "reason": "not_found",
+                "message": error_message,
+            }
+        }
+
 
 class TestXComsDeleteEndpoint:
     def test_xcom_delete_endpoint(self, client, create_task_instance, authenticate_as, session):
