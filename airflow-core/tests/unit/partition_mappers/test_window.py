@@ -18,7 +18,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from unittest import mock
+from zoneinfo import ZoneInfo
 
+import pendulum
 import pytest
 
 from airflow import plugins_manager
@@ -54,6 +56,50 @@ class TestHourWindow:
         members = list(HourWindow().to_upstream(period_start))
         assert members == [datetime(2024, 6, 10, 14, m) for m in range(60)]
 
+    def test_rollup_fall_back_without_offset_downstream_yields_120_minutes(self):
+        mapper = RollupMapper(
+            upstream_mapper=StartOfHourMapper(
+                timezone="America/New_York",
+                input_format="%Y-%m-%dT%H:%M%z",
+                output_format="%Y-%m-%dT%H",
+            ),
+            window=HourWindow(),
+        )
+        upstream_keys = mapper.to_upstream("2024-11-03T01")
+        assert len(upstream_keys) == 120
+        assert "2024-11-03T01:00-0400" in upstream_keys
+        assert "2024-11-03T01:59-0400" in upstream_keys
+        assert "2024-11-03T01:00-0500" in upstream_keys
+        assert "2024-11-03T01:59-0500" in upstream_keys
+
+    def test_rollup_fall_back_with_offset_downstream_yields_60_minutes(self):
+        mapper = RollupMapper(
+            upstream_mapper=StartOfHourMapper(
+                timezone="America/New_York",
+                input_format="%Y-%m-%dT%H:%M%z",
+                output_format="%Y-%m-%dT%H%z",
+            ),
+            window=HourWindow(),
+        )
+        first_hour = mapper.to_upstream("2024-11-03T01-0400")
+        second_hour = mapper.to_upstream("2024-11-03T01-0500")
+        assert len(first_hour) == 60
+        assert len(second_hour) == 60
+        assert first_hour.isdisjoint(second_hour)
+        assert "2024-11-03T01:30-0400" in first_hour
+        assert "2024-11-03T01:30-0500" in second_hour
+
+    def test_rollup_spring_forward_gap_hour_yields_empty(self):
+        mapper = RollupMapper(
+            upstream_mapper=StartOfHourMapper(
+                timezone="America/New_York",
+                input_format="%Y-%m-%dT%H:%M%z",
+                output_format="%Y-%m-%dT%H",
+            ),
+            window=HourWindow(),
+        )
+        assert mapper.to_upstream("2024-03-10T02") == frozenset()
+
 
 class TestDayWindow:
     def test_yields_24_hourly_period_starts(self):
@@ -62,44 +108,165 @@ class TestDayWindow:
         assert members == [datetime(2024, 6, 10, h) for h in range(24)]
 
     def test_day_window_yields_24_naive_steps_regardless_of_dst(self):
-        """DayWindow always yields exactly 24 naive steps; it does not know about DST."""
-        # 2024-03-10: US Eastern spring-forward (clocks skip 02:00 → 03:00).
+        """DayWindow yields 24 naive steps when given a naive datetime without timezone."""
+        # 2024-03-10: US Eastern spring-forward (clocks skip 02:00 -> 03:00).
         spring_forward = datetime(2024, 3, 10)
         assert list(DayWindow().to_upstream(spring_forward)) == [datetime(2024, 3, 10, h) for h in range(24)]
 
-        # 2024-11-03: US Eastern fall-back (clocks repeat 01:00 → 01:00).
+        # 2024-11-03: US Eastern fall-back (clocks repeat 01:00 -> 01:00).
         fall_back = datetime(2024, 11, 3)
         assert list(DayWindow().to_upstream(fall_back)) == [datetime(2024, 11, 3, h) for h in range(24)]
 
-    @pytest.mark.xfail(
-        reason=(
-            "DayWindow with a local-timezone upstream mapper cannot satisfy the rollup on a "
-            "spring-forward day: the 02:00 ET gap causes one naive step to encode to "
-            "03:00 ET, which upstream producers never emit. This is an accepted limitation "
-            "of naive 24-hour stepping — the documented mitigation is to use UTC input_format "
-            "so local-clock ambiguity never arises. See DayWindow's docstring."
-        ),
-        strict=True,
+    @pytest.mark.parametrize(
+        "tz",
+        [
+            pytest.param(pendulum.timezone("America/New_York"), id="pendulum"),
+            pytest.param(ZoneInfo("America/New_York"), id="zoneinfo"),
+        ],
     )
-    def test_day_window_rollup_under_yields_on_spring_forward_with_local_tz(self):
-        """
-        Rollup with a local-timezone upstream mapper is unsatisfiable on spring-forward days.
+    def test_day_window_aware_dst_transitions(self, tz):
+        spring_members = list(DayWindow().to_upstream(datetime(2024, 3, 10, tzinfo=tz)))
+        assert len(spring_members) == 23
+        assert [m.hour for m in spring_members] == [0, 1, *range(3, 24)]
 
-        DayWindow generates 24 naive steps. StartOfDayMapper(timezone="America/New_York")
-        encodes each step into a local-time key. On 2024-03-10 (spring-forward), 02:00
-        local time does not exist — the encoder produces "2024-03-10T03" for *two*
-        consecutive steps. One expected upstream key ("2024-03-10T02") is never emitted
-        by any real producer, so to_upstream returns a frozenset of 23 *distinct* keys.
-        The rollup window requires all 24 and therefore can never be satisfied.
-        """
+        fall_members = list(DayWindow().to_upstream(datetime(2024, 11, 3, tzinfo=tz)))
+        assert len(fall_members) == 25
+        assert [m.strftime("%Y-%m-%dT%H%z") for m in fall_members[:4]] == [
+            "2024-11-03T00-0400",
+            "2024-11-03T01-0400",
+            "2024-11-03T01-0500",
+            "2024-11-03T02-0500",
+        ]
+
+    @pytest.mark.parametrize(
+        ("tz_name", "day_key", "fmt", "expected_count", "must_contain", "must_exclude"),
+        [
+            pytest.param(
+                "America/New_York",
+                "2024-03-10",
+                "%Y-%m-%dT%H",
+                23,
+                {"2024-03-10T00", "2024-03-10T01", "2024-03-10T03", "2024-03-10T23"},
+                {"2024-03-10T02"},
+                id="ny-spring-no-offset",
+            ),
+            pytest.param(
+                "America/New_York",
+                "2024-03-10",
+                "%Y-%m-%dT%H%z",
+                23,
+                {"2024-03-10T01-0500", "2024-03-10T03-0400"},
+                {"2024-03-10T02-0500", "2024-03-10T02-0400"},
+                id="ny-spring-with-offset",
+            ),
+            pytest.param(
+                "America/New_York",
+                "2024-11-03",
+                "%Y-%m-%dT%H",
+                24,
+                {"2024-11-03T00", "2024-11-03T01", "2024-11-03T23"},
+                set(),
+                id="ny-fall-no-offset",
+            ),
+            pytest.param(
+                "America/New_York",
+                "2024-11-03",
+                "%Y-%m-%dT%H%z",
+                25,
+                {"2024-11-03T00-0400", "2024-11-03T01-0400", "2024-11-03T01-0500", "2024-11-03T23-0500"},
+                set(),
+                id="ny-fall-with-offset",
+            ),
+            pytest.param(
+                "Europe/Madrid",
+                "2024-10-27",
+                "%Y-%m-%dT%H%z",
+                25,
+                {"2024-10-27T02+0200", "2024-10-27T02+0100"},
+                set(),
+                id="madrid-fall-with-offset",
+            ),
+            pytest.param(
+                "America/Santiago",
+                "2024-09-08",
+                "%Y-%m-%dT%H%z",
+                23,
+                {"2024-09-08T01-0300", "2024-09-08T23-0300"},
+                {"2024-09-08T00-0400", "2024-09-08T00-0300"},
+                id="santiago-midnight-spring-gap",
+            ),
+            pytest.param(
+                "America/Santiago",
+                "2024-04-06",
+                "%Y-%m-%dT%H%z",
+                25,
+                {"2024-04-06T23-0300", "2024-04-06T23-0400"},
+                set(),
+                id="santiago-23h-fall-fold",
+            ),
+            pytest.param(
+                "America/Havana",
+                "2024-11-03",
+                "%Y-%m-%dT%H%z",
+                25,
+                {"2024-11-03T00-0400", "2024-11-03T00-0500", "2024-11-03T23-0500"},
+                set(),
+                id="havana-midnight-fall-fold",
+            ),
+            pytest.param(
+                "Australia/Lord_Howe",
+                "2024-10-06",
+                "%Y-%m-%dT%H%z",
+                23,
+                {"2024-10-06T01+1030", "2024-10-06T03+1100"},
+                {"2024-10-06T02+1030", "2024-10-06T02+1100"},
+                id="lord-howe-30min-spring-gap",
+            ),
+            pytest.param(
+                "UTC",
+                "2024-11-03",
+                "%Y-%m-%dT%H%z",
+                24,
+                {"2024-11-03T00+0000", "2024-11-03T23+0000"},
+                set(),
+                id="utc-non-dst",
+            ),
+            pytest.param(
+                "Asia/Taipei",
+                "2024-11-03",
+                "%Y-%m-%dT%H%z",
+                24,
+                {"2024-11-03T00+0800", "2024-11-03T23+0800"},
+                set(),
+                id="taipei-non-dst",
+            ),
+        ],
+    )
+    def test_day_window_rollup_dst_awareness(
+        self, tz_name, day_key, fmt, expected_count, must_contain, must_exclude
+    ):
         mapper = RollupMapper(
-            upstream_mapper=StartOfDayMapper(timezone="America/New_York", input_format="%Y-%m-%dT%H"),
+            upstream_mapper=StartOfDayMapper(timezone=tz_name, input_format=fmt),
             window=DayWindow(),
         )
-        upstream_keys = mapper.to_upstream("2024-03-10")
-        # A correctly functioning rollup would expect exactly 24 distinct upstream keys.
-        # On spring-forward this assertion fails because only 23 distinct keys are produced.
-        assert len(upstream_keys) == 24
+        upstream_keys = mapper.to_upstream(day_key)
+        assert len(upstream_keys) == expected_count
+        assert must_contain <= upstream_keys
+        assert upstream_keys.isdisjoint(must_exclude)
+
+    def test_day_window_backward_rollup_across_dst(self):
+        mapper = RollupMapper(
+            upstream_mapper=StartOfDayMapper(timezone="America/New_York", input_format="%Y-%m-%dT%H%z"),
+            window=DayWindow(direction=Window.Direction.BACKWARD),
+        )
+        fall_trailing = mapper.to_upstream("2024-11-04")
+        assert len(fall_trailing) == 25
+        assert {"2024-11-03T01-0400", "2024-11-03T01-0500", "2024-11-04T00-0500"} <= fall_trailing
+
+        spring_trailing = mapper.to_upstream("2024-03-11")
+        assert len(spring_trailing) == 23
+        assert "2024-03-10T02-0500" not in spring_trailing
+        assert "2024-03-11T00-0400" in spring_trailing
 
 
 class TestWeekWindow:
@@ -117,6 +284,42 @@ class TestWeekWindow:
             datetime(2024, 6, 16),
         ]
 
+    def test_aware_week_across_dst_preserves_midnight(self):
+        tz = pendulum.timezone("America/New_York")
+        members = list(WeekWindow().to_upstream(pendulum.datetime(2024, 3, 4, tz=tz)))
+        assert len(members) == 7
+        assert all(m.hour == 0 for m in members)
+        assert [m.strftime("%Y-%m-%dT%H%z") for m in members] == [
+            f"2024-03-{d:02d}T00-0500" for d in range(4, 11)
+        ]
+
+        spring_cross = list(WeekWindow().to_upstream(pendulum.datetime(2024, 3, 9, tz=tz)))
+        assert [m.strftime("%Y-%m-%dT%H%z") for m in spring_cross] == [
+            "2024-03-09T00-0500",
+            "2024-03-10T00-0500",
+            "2024-03-11T00-0400",
+            "2024-03-12T00-0400",
+            "2024-03-13T00-0400",
+            "2024-03-14T00-0400",
+            "2024-03-15T00-0400",
+        ]
+
+    def test_week_rollup_across_dst_with_offset(self):
+        mapper = RollupMapper(
+            upstream_mapper=StartOfWeekMapper(timezone="America/New_York", input_format="%Y-%m-%dT%H%z"),
+            window=WeekWindow(),
+        )
+        assert mapper.to_upstream("2024-10-28 (W44)") == frozenset(
+            f"2024-10-{d:02d}T00-0400" for d in range(28, 32)
+        ) | {
+            "2024-11-01T00-0400",
+            "2024-11-02T00-0400",
+            "2024-11-03T00-0400",
+        }
+        assert mapper.to_upstream("2024-11-04 (W45)") == frozenset(
+            f"2024-11-{d:02d}T00-0500" for d in range(4, 11)
+        )
+
 
 class TestMonthWindow:
     def test_yields_all_days_in_february_leap_year(self):
@@ -126,6 +329,30 @@ class TestMonthWindow:
     def test_crosses_year_boundary(self):
         members = list(MonthWindow().to_upstream(datetime(2024, 12, 1)))
         assert members == [datetime(2024, 12, d) for d in range(1, 32)]
+
+    def test_aware_month_across_dst_preserves_day_count_and_midnight(self):
+        tz = pendulum.timezone("America/New_York")
+        march = list(MonthWindow().to_upstream(pendulum.datetime(2024, 3, 1, tz=tz)))
+        assert len(march) == 31
+        assert all(m.hour == 0 for m in march)
+        assert march[9].strftime("%Y-%m-%dT%H%z") == "2024-03-10T00-0500"
+        assert march[10].strftime("%Y-%m-%dT%H%z") == "2024-03-11T00-0400"
+        assert march[-1].strftime("%Y-%m-%dT%H%z") == "2024-03-31T00-0400"
+
+        november = list(MonthWindow().to_upstream(pendulum.datetime(2024, 11, 1, tz=tz)))
+        assert len(november) == 30
+        assert all(m.hour == 0 for m in november)
+        assert november[2].strftime("%Y-%m-%dT%H%z") == "2024-11-03T00-0400"
+        assert november[3].strftime("%Y-%m-%dT%H%z") == "2024-11-04T00-0500"
+
+    def test_month_rollup_with_midnight_dst_gap_keeps_all_days(self):
+        mapper = RollupMapper(
+            upstream_mapper=StartOfMonthMapper(timezone="America/Santiago", input_format="%Y-%m-%d"),
+            window=MonthWindow(),
+        )
+        keys = mapper.to_upstream("2024-09")
+        assert len(keys) == 30
+        assert "2024-09-08" in keys
 
     def test_rejects_non_day_one_input(self):
         # A custom decode_downstream that yields Jan 31 would crash month
@@ -140,6 +367,18 @@ class TestQuarterWindow:
         members = list(QuarterWindow().to_upstream(datetime(2024, 4, 1)))
         assert members == [datetime(2024, 4, 1), datetime(2024, 5, 1), datetime(2024, 6, 1)]
 
+    def test_quarter_rollup_across_dst_with_offset(self):
+        mapper = RollupMapper(
+            upstream_mapper=StartOfQuarterMapper(timezone="America/New_York", input_format="%Y-%m-%dT%H%z"),
+            window=QuarterWindow(),
+        )
+        assert mapper.to_upstream("2024-Q1") == frozenset(
+            {"2024-01-01T00-0500", "2024-02-01T00-0500", "2024-03-01T00-0500"}
+        )
+        assert mapper.to_upstream("2024-Q4") == frozenset(
+            {"2024-10-01T00-0400", "2024-11-01T00-0400", "2024-12-01T00-0500"}
+        )
+
     def test_rejects_non_day_one_input(self):
         with pytest.raises(ValueError, match="expects a period start on day 1"):
             list(QuarterWindow().to_upstream(datetime(2024, 1, 31)))
@@ -149,6 +388,15 @@ class TestYearWindow:
     def test_yields_twelve_monthly_period_starts(self):
         members = list(YearWindow().to_upstream(datetime(2024, 1, 1)))
         assert members == [datetime(2024, m, 1) for m in range(1, 13)]
+
+    def test_aware_year_preserves_midnight_across_dst(self):
+        tz = pendulum.timezone("America/New_York")
+        members = list(YearWindow().to_upstream(pendulum.datetime(2024, 1, 1, tz=tz)))
+        assert len(members) == 12
+        assert all(m.hour == 0 for m in members)
+        assert members[0].strftime("%Y-%m-%dT%H%z") == "2024-01-01T00-0500"
+        assert members[3].strftime("%Y-%m-%dT%H%z") == "2024-04-01T00-0400"
+        assert members[11].strftime("%Y-%m-%dT%H%z") == "2024-12-01T00-0500"
 
     def test_rejects_non_day_one_input(self):
         with pytest.raises(ValueError, match="expects a period start on day 1"):

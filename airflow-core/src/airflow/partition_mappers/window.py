@@ -17,14 +17,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import attrs
 
+from airflow._shared.timezones.timezone import convert_to_utc, make_aware
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+    from datetime import tzinfo
 
 
 def _require_day_one(dt: datetime, window_cls: type) -> None:
@@ -79,6 +82,62 @@ def _build_directional_steps(
     return (step(base, i) for i in range(count))
 
 
+def _localize_all_folds(naive: datetime, timezone: tzinfo) -> list[datetime]:
+    """
+    Return every aware instant a naive wall-clock time maps to, earliest first.
+
+    A wall-clock time inside a fall-back fold occurs twice (``fold=0`` then
+    ``fold=1``); a wall-clock time skipped by a spring-forward gap never occurs
+    and returns an empty list.
+    """
+
+    def _attach(dt_naive: datetime, fold: int) -> datetime:
+        candidate = dt_naive.replace(fold=fold)
+        localized = getattr(timezone, "localize", None)
+        if localized is not None:
+            return localized(candidate)
+        convert = getattr(timezone, "convert", None)
+        if convert is not None:
+            return convert(candidate)
+        return candidate.replace(tzinfo=timezone)
+
+    first = _attach(naive, 0)
+    second = _attach(naive, 1)
+    first_roundtrip = first.astimezone(UTC).astimezone(timezone).replace(tzinfo=None)
+    if first.replace(tzinfo=None) != naive or first_roundtrip != naive:
+        return []
+    if first.utcoffset() != second.utcoffset():
+        return [first, second]
+    return [first]
+
+
+def _expand_subday_steps(
+    steps: Iterable[datetime],
+    timezone: tzinfo,
+    *,
+    bound: datetime | None = None,
+    backward: bool = False,
+) -> list[datetime]:
+    """Expand naive sub-day wall-clock steps across *timezone* DST transitions."""
+    bound_utc = convert_to_utc(bound) if bound is not None else None
+    result: list[datetime] = []
+    for step in steps:
+        for instant in _localize_all_folds(step, timezone):
+            if bound_utc is not None:
+                instant_utc = convert_to_utc(instant)
+                if backward and instant_utc > bound_utc:
+                    continue
+                if not backward and instant_utc < bound_utc:
+                    continue
+            result.append(instant)
+    return result
+
+
+def _localize_calendar_steps(steps: Iterable[datetime], timezone: tzinfo) -> Iterable[datetime]:
+    """Attach *timezone* to each naive calendar-date step without dropping DST-gap midnights."""
+    return (make_aware(step, timezone) for step in steps)
+
+
 class Window(ABC):
     """
     Describes a rollup window: which decoded upstream items make up one decoded downstream period.
@@ -128,6 +187,16 @@ class Window(ABC):
     def to_upstream(self, decoded_downstream: Any) -> Iterable[Any]:
         """Yield each decoded upstream item composing *decoded_downstream*."""
 
+    def _to_upstream_in_timezone(self, decoded_downstream: Any, timezone: tzinfo) -> Iterable[Any]:
+        """
+        Expand *decoded_downstream* with *timezone* DST awareness.
+
+        Default delegates to :meth:`to_upstream` so custom ``Window`` subclasses
+        that only implement ``to_upstream(decoded_downstream)`` keep working
+        without changes.
+        """
+        return self.to_upstream(decoded_downstream)
+
     def serialize(self) -> dict[str, Any]:
         return {"direction": self.direction.value}
 
@@ -137,67 +206,94 @@ class Window(ABC):
 
 
 class HourWindow(Window):
-    """Sixty consecutive minute period-starts making up one hour."""
+    """Consecutive minute period-starts making up one hour."""
 
     expected_decoded_type: ClassVar[type] = datetime
 
     def to_upstream(self, period_start: datetime) -> Iterable[datetime]:
-        return _build_directional_steps(
-            period_start, 60, lambda s, i: s + timedelta(minutes=i), self.direction
+        if period_start.tzinfo is None:
+            return _build_directional_steps(
+                period_start, 60, lambda s, i: s + timedelta(minutes=i), self.direction
+            )
+        tz = period_start.tzinfo
+        anchor_utc = convert_to_utc(period_start)
+        return (
+            step.astimezone(tz)
+            for step in _build_directional_steps(
+                anchor_utc, 60, lambda s, i: s + timedelta(minutes=i), self.direction
+            )
         )
+
+    def _to_upstream_in_timezone(self, decoded_downstream: Any, timezone: tzinfo) -> Iterable[Any]:
+        if decoded_downstream.tzinfo is not None:
+            return self.to_upstream(decoded_downstream.astimezone(timezone))
+        return _expand_subday_steps(self.to_upstream(decoded_downstream), timezone)
 
 
 class DayWindow(Window):
     """
-    Twenty-four consecutive hourly period-starts making up one day.
+    Hourly period-starts making up one calendar day.
 
-    Arithmetic is done on naive datetime steps so the 24-hour stride is
-    unambiguous across DST transitions; the upstream mapper handles timezone
-    awareness when it encodes each upstream member back to a key string.
-
-    .. warning:: **DST edge cases with local-timezone upstream mappers**
-
-        ``DayWindow`` always yields exactly 24 steps regardless of the local
-        calendar date. When the upstream mapper uses a local timezone
-        (e.g. ``StartOfDayMapper(timezone="America/New_York")``), DST gaps
-        and folds can cause a mismatch:
-
-        - **Spring-forward (clock skips ahead)**: the local day has fewer than
-          24 real hours. One naive step falls in the gap (e.g. 02:00 ET on
-          spring-forward day does not exist), so the upstream mapper encodes it
-          to the *next* local hour. That key (e.g. ``"2024-03-10T03"``) does
-          not match any upstream event — the rollup window can never be fully
-          satisfied.
-        - **Fall-back (clock repeats)**: the local day has 25 real hours, but
-          ``DayWindow`` only enumerates 24 steps. The extra hour's upstream
-          events are never included in the expected set, so those events do not
-          contribute to any rollup.
-
-        **Mitigation**: use UTC ``input_format`` (e.g. ``%Y-%m-%dT%H%z``) and
-        ensure upstream producers emit UTC partition keys so local-clock
-        ambiguity never arises.
-
-        The same 24-hour-stride assumption applies to ``DayWindow(direction=Window.Direction.BACKWARD)``:
-        the 24 members are enumerated as naive hourly steps ending at the anchor, not as
-        a step back to the "previous calendar day" in local time.
+    When given a naive ``datetime``, yields 24 consecutive hourly steps. When
+    given a timezone-aware ``datetime`` (or paired with a timezone-bearing
+    upstream mapper in :class:`~airflow.partition_mappers.base.RollupMapper`),
+    expands each wall-clock hour across DST transitions so spring-forward days
+    skip nonexistent gap hours (e.g. 23 hours) and fall-back days include both
+    occurrences of repeated fold hours (e.g. 25 hours).
     """
 
     expected_decoded_type: ClassVar[type] = datetime
 
     def to_upstream(self, period_start: datetime) -> Iterable[datetime]:
-        return _build_directional_steps(period_start, 24, lambda s, i: s + timedelta(hours=i), self.direction)
+        if period_start.tzinfo is None:
+            return _build_directional_steps(
+                period_start, 24, lambda s, i: s + timedelta(hours=i), self.direction
+            )
+        naive_steps = _build_directional_steps(
+            period_start.replace(tzinfo=None), 24, lambda s, i: s + timedelta(hours=i), self.direction
+        )
+        return _expand_subday_steps(
+            naive_steps,
+            period_start.tzinfo,
+            bound=period_start,
+            backward=self.direction is Window.Direction.BACKWARD,
+        )
+
+    def _to_upstream_in_timezone(self, decoded_downstream: Any, timezone: tzinfo) -> Iterable[Any]:
+        if decoded_downstream.tzinfo is not None:
+            return self.to_upstream(decoded_downstream.astimezone(timezone))
+        return _expand_subday_steps(self.to_upstream(decoded_downstream), timezone)
 
 
-class WeekWindow(Window):
+class _CalendarDateWindow(Window):
+    """Shared DST-safe calendar-date localization for day- and month-granularity windows."""
+
+    def _to_upstream_in_timezone(self, decoded_downstream: Any, timezone: tzinfo) -> Iterable[Any]:
+        naive = (
+            decoded_downstream.replace(tzinfo=None)
+            if decoded_downstream.tzinfo is not None
+            else decoded_downstream
+        )
+        return _localize_calendar_steps(self.to_upstream(naive), timezone)
+
+
+class WeekWindow(_CalendarDateWindow):
     """Seven consecutive daily period-starts making up one week."""
 
     expected_decoded_type: ClassVar[type] = datetime
 
     def to_upstream(self, period_start: datetime) -> Iterable[datetime]:
-        return _build_directional_steps(period_start, 7, lambda s, i: s + timedelta(days=i), self.direction)
+        if period_start.tzinfo is None:
+            return _build_directional_steps(
+                period_start, 7, lambda s, i: s + timedelta(days=i), self.direction
+            )
+        naive_steps = _build_directional_steps(
+            period_start.replace(tzinfo=None), 7, lambda s, i: s + timedelta(days=i), self.direction
+        )
+        return _localize_calendar_steps(naive_steps, period_start.tzinfo)
 
 
-class MonthWindow(Window):
+class MonthWindow(_CalendarDateWindow):
     """
     All daily period-starts making up one calendar month.
 
@@ -213,7 +309,9 @@ class MonthWindow(Window):
         # Not expressible via _build_directional_steps: the member count is not fixed (28-31)
         # and BACKWARD is an open-closed (prev_month_start, anchor] generator, not a
         # shift-then-forward mirror of FORWARD.
-        _require_day_one(period_start, type(self))
+        tz = period_start.tzinfo
+        naive = period_start.replace(tzinfo=None) if tz is not None else period_start
+        _require_day_one(naive, type(self))
         if self.direction is Window.Direction.BACKWARD:
             # Backward yields the trailing period ending at the anchor (period_start),
             # analogous to WeekWindow BACKWARD which yields the 7 days ending at the
@@ -222,32 +320,40 @@ class MonthWindow(Window):
             # previous month's 1st up to and including anchor itself.  This does NOT
             # align to a calendar month: anchor=Mar 1 yields Feb 2…Mar 1 (29 days in
             # 2024), not the full calendar February.
-            prev = _shift_months(period_start, -1)
-            days = (period_start - prev).days
-            return (prev + timedelta(days=i + 1) for i in range(days))
-        next_start = _shift_months(period_start, 1)
-        days = (next_start - period_start).days
-        return (period_start + timedelta(days=i) for i in range(days))
+            prev = _shift_months(naive, -1)
+            days = (naive - prev).days
+            steps = (prev + timedelta(days=i + 1) for i in range(days))
+        else:
+            next_start = _shift_months(naive, 1)
+            days = (next_start - naive).days
+            steps = (naive + timedelta(days=i) for i in range(days))
+        return _localize_calendar_steps(steps, tz) if tz is not None else steps
 
 
-class QuarterWindow(Window):
+class QuarterWindow(_CalendarDateWindow):
     """Three monthly period-starts making up one calendar quarter (e.g. Jan/Feb/Mar for Q1)."""
 
     expected_decoded_type: ClassVar[type] = datetime
 
     def to_upstream(self, period_start: datetime) -> Iterable[datetime]:
-        _require_day_one(period_start, type(self))
-        return _build_directional_steps(period_start, 3, _shift_months, self.direction)
+        tz = period_start.tzinfo
+        naive = period_start.replace(tzinfo=None) if tz is not None else period_start
+        _require_day_one(naive, type(self))
+        steps = _build_directional_steps(naive, 3, _shift_months, self.direction)
+        return _localize_calendar_steps(steps, tz) if tz is not None else steps
 
 
-class YearWindow(Window):
+class YearWindow(_CalendarDateWindow):
     """Twelve consecutive monthly period-starts making up one calendar year."""
 
     expected_decoded_type: ClassVar[type] = datetime
 
     def to_upstream(self, period_start: datetime) -> Iterable[datetime]:
-        _require_day_one(period_start, type(self))
-        return _build_directional_steps(period_start, 12, _shift_months, self.direction)
+        tz = period_start.tzinfo
+        naive = period_start.replace(tzinfo=None) if tz is not None else period_start
+        _require_day_one(naive, type(self))
+        steps = _build_directional_steps(naive, 12, _shift_months, self.direction)
+        return _localize_calendar_steps(steps, tz) if tz is not None else steps
 
 
 def _convert_segments(segments: Iterable[str]) -> frozenset[str]:

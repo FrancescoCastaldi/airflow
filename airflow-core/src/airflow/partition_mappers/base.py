@@ -191,9 +191,14 @@ class RollupMapper(PartitionMapper):
     def to_upstream(self, downstream_key: str) -> frozenset[str]:
         """Return the complete set of upstream partition keys required for *downstream_key*."""
         decoded = self.upstream_mapper.decode_downstream(downstream_key)
+        tz = getattr(self.upstream_mapper, "_timezone", None)
+        members = (
+            self.window._to_upstream_in_timezone(decoded, tz)
+            if tz is not None
+            else self.window.to_upstream(decoded)
+        )
         return frozenset(
-            self.upstream_mapper.encode_upstream(expected_upstream)
-            for expected_upstream in self.window.to_upstream(decoded)
+            self.upstream_mapper.encode_upstream(expected_upstream) for expected_upstream in members
         )
 
     def to_partition_date(self, downstream_key: str) -> datetime | None:

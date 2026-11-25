@@ -818,12 +818,12 @@ error is a type mismatch: an identity-decoding mapper's ``expected_decoded_type`
 ``datetime``; ``RollupMapper`` detects the mismatch at construction time and
 raises before the Dag is scheduled.
 
-``DayWindow`` always enumerates twenty-four hourly steps. With an upstream mapper
-configured for a local timezone that observes daylight-saving time, the spring-forward
-day has only twenty-three real hours (one window member never has a matching event,
-so the run is held indefinitely) and the fall-back day has twenty-five (the repeated
-hour is dropped). Use a UTC-based upstream mapper for any rollup that crosses a DST
-boundary; see the ``DayWindow`` class docstring for the full discussion.
+When paired with a local-timezone upstream mapper that observes daylight-saving time,
+:class:`~airflow.sdk.DayWindow` and :class:`~airflow.sdk.HourWindow` expand each
+calendar period across DST transitions so spring-forward periods omit nonexistent gap
+hours (yielding 23 hourly keys for a 23-hour day) and fall-back periods include both
+occurrences of repeated fold hours (yielding 25 hourly keys when ``input_format``
+includes an offset such as ``%z``).
 
 Wait policies
 ~~~~~~~~~~~~~

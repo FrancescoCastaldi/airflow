@@ -226,10 +226,8 @@ class _BaseTemporalMapper(PartitionMapper):
         rather than re-interpreting the wall-clock as local time.
         """
         if dt.tzinfo is not None:
-            naive = dt.astimezone(self._timezone).replace(tzinfo=None)
-        else:
-            naive = dt
-        return make_aware(naive, self._timezone).strftime(self.input_format)
+            return dt.astimezone(self._timezone).strftime(self.input_format)
+        return make_aware(dt, self._timezone).strftime(self.input_format)
 
     def serialize(self) -> dict[str, Any]:
         from airflow.serialization.encoders import encode_timezone

@@ -195,6 +195,15 @@ class TestTemporalMappers:
         encoded = mapper.encode_upstream(decoded)
         assert encoded == "2024-03-12T18:30:00"
 
+    def test_encode_upstream_preserves_fold_on_aware_datetime(self):
+        """Aware datetimes in the target timezone preserve fold=0 vs fold=1 across fall-back."""
+        mapper = StartOfDayMapper(
+            timezone="America/New_York",
+            input_format="%Y-%m-%dT%H%z",
+        )
+        assert mapper.encode_upstream(datetime(2024, 11, 3, 5, tzinfo=UTC)) == "2024-11-03T01-0400"
+        assert mapper.encode_upstream(datetime(2024, 11, 3, 6, tzinfo=UTC)) == "2024-11-03T01-0500"
+
     def test_start_of_week_decode_rejects_trailing_garbage(self):
         """malformed downstream_key with trailing garbage must raise, not silently match a substring."""
         mapper = StartOfWeekMapper()
